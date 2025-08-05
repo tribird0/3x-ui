@@ -53,14 +53,14 @@ if [[ $? -ne 0 ]]; then
 fi
 print_success "x-ui installed successfully."
 
-# Step 3: Install Nginx, Certbot, UFW
-print_info "Installing Nginx, Certbot, and UFW..."
+# Step 3: Install Nginx, Certbot, UFW/firewalld
+print_info "Installing Nginx, Certbot, and firewall..."
 if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
     apt-get install -y nginx software-properties-common certbot python3-certbot-nginx ufw
 elif [[ "$OS" == "centos" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
     yum -y install epel-release || dnf -y install epel-release
     yum -y install nginx certbot python3-certbot-nginx firewalld
-    systemctl enable firewalld && systemctl start firewalld
+    systemctl enable firewalld --now
 else
     print_error "Unsupported OS for package installation."
     exit 1
@@ -83,25 +83,31 @@ elif [[ "$OS" == "centos" || "$OS" == "almalinux" || "$OS" == "rocky" ]]; then
 fi
 
 # Step 5: Prompt user for domain and email
-print_info "Please enter your domain and email:"
+print_info "Please enter your configuration:"
 read -p "📧 Email for Let's Encrypt: " user_email
 read -p "🌐 Subdomain (e.g., xui.yourdomain.com): " subdomain
+read -p "🔧 x-ui Panel Port (e.g., 8443): " panel_port
+read -p "🔗 Panel WebBasePath (e.g., secret-panel): " web_path
 
 # Validate input
-if [[ -z "$user_email" || -z "$subdomain" ]]; then
-    print_error "Email or subdomain cannot be empty."
+if [[ -z "$user_email" || -z "$subdomain" || -z "$panel_port" || -z "$web_path" ]]; then
+    print_error "Email, domain, port, and path are required!"
     exit 1
 fi
 
-# Optional: Check if domain resolves to this server
-server_ip=$(curl -s https://api.ipify.org)
-domain_ip=$(dig +short "$subdomain" | tail -1)
+# Validate port
+if ! [[ "$panel_port" =~ ^[0-9]+$ ]] || [[ "$panel_port" -lt 1024 || "$panel_port" -gt 65535 ]]; then
+    print_error "Port must be between 1024 and 65535."
+    exit 1
+fi
 
+# Check domain resolves
+server_ip=$(curl -s https://api.ipify.org)
+domain_ip=$(dig +short "$subdomain" | tail -n1)
 if [[ -n "$domain_ip" && "$server_ip" != "$domain_ip" ]]; then
-    print_warning "Domain $subdomain resolves to $domain_ip, but server IP is $server_ip"
-    print_warning "SSL issuance may fail until DNS is corrected."
+    print_warning "Domain $subdomain resolves to $domain_ip, not $server_ip"
     read -rp "Continue anyway? [y/N]: " confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && exit 1
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 1
 fi
 
 # Step 6: Obtain SSL Certificate
@@ -114,7 +120,7 @@ certbot --nginx \
     --redirect
 
 if [[ $? -ne 0 ]]; then
-    print_error "Failed to obtain SSL certificate. Check DNS and try again."
+    print_error "Failed to obtain SSL certificate. Check DNS."
     exit 1
 fi
 print_success "SSL certificate issued successfully."
@@ -122,26 +128,15 @@ print_success "SSL certificate issued successfully."
 # Test renewal
 certbot renew --dry-run > /dev/null 2>&1 && \
     print_success "Certificate renewal test passed." || \
-    print_warning "Renewal test failed. Check later with 'certbot renew --dry-run'"
+    print_warning "Renewal test failed. Will retry later."
 
-# Step 7: Configure x-ui Port
-print_info "Configuring x-ui to run on port 8081..."
+# Step 7: Configure x-ui Port & WebBasePath
+print_info "Configuring x-ui settings..."
+/usr/local/x-ui/x-ui setting -port "$panel_port" -webBasePath "/$web_path"
+systemctl restart x-ui
+print_success "x-ui configured: Port=$panel_port, Path=/$web_path"
 
-# Get current x-ui settings
-current_port=$(/usr/local/x-ui/x-ui setting -show true 2>/dev/null | grep -oP 'port: \K[0-9]+')
-
-if [[ -n "$current_port" && "$current_port" != "8081" ]]; then
-    /usr/local/x-ui/x-ui setting -port 8081
-    sleep 2
-    systemctl restart x-ui
-    print_success "x-ui port set to 8081."
-elif [[ -z "$current_port" ]]; then
-    print_warning "Could not detect x-ui port. Please configure manually via 'x-ui' command."
-else
-    print_info "x-ui already running on port 8081."
-fi
-
-# Step 8: Ensure Nginx reverse proxy is correct
+# Step 8: Nginx Reverse Proxy Config
 nginx_config="/etc/nginx/sites-available/x-ui"
 cat > "$nginx_config" << EOF
 server {
@@ -162,10 +157,9 @@ server {
     ssl_certificate /etc/letsencrypt/live/$subdomain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$subdomain/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:ECDHE-RSA-AES256-SHA384;
-    ssl_prefer_server_ciphers off;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
 
-    location / {
+    location /$web_path {
         proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -173,10 +167,15 @@ server {
         proxy_set_header Range \$http_range;
         proxy_set_header If-Range \$http_if_range;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:2053;
+        proxy_pass http://127.0.0.1:$panel_port;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
+    }
+
+    # Redirect root to prevent exposure
+    location = / {
+        return 301 https://\$server_name/$web_path;
     }
 }
 EOF
@@ -185,39 +184,39 @@ EOF
 ln -sf "$nginx_config" /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default >/dev/null 2>&1
 
-# Test and reload Nginx
+# Test Nginx config
 print_info "Testing Nginx configuration..."
 nginx -t
 if [[ $? -ne 0 ]]; then
-    print_error "Nginx configuration test failed. Check /etc/nginx/sites-available/x-ui"
+    print_error "Nginx configuration test failed!"
     exit 1
 fi
 
 systemctl reload nginx
 print_success "Nginx reverse proxy configured and reloaded."
 
-# Step 9: Restart and enable x-ui
+# Step 9: Finalize x-ui
 systemctl daemon-reload
 systemctl enable x-ui
 systemctl restart x-ui
 
-# Step 10: Setup auto-renewal
-(crontab -l 2>/dev/null | grep -v "certbot renew") || echo "" | crontab -
+# Step 10: Auto-renew SSL
+(crontab -l 2>/dev/null | grep -v "certbot renew") | crontab -
 (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
 print_success "SSL auto-renewal scheduled via cron."
 
 # Final Output
 echo
-echo -e "${green}🎉 Installation completed successfully!${plain}"
+echo -e "${green}🎉 x-ui Installation Complete!${plain}"
 echo
-echo -e "🔐 ${blue}Access Panel:${plain} https://${subdomain}"
+echo -e "🔐 ${blue}Access Panel:${plain} ${green}https://$subdomain/$web_path${plain}"
 echo -e "👤 ${blue}Default Login:${plain} ${yellow}admin${plain} / ${yellow}admin${plain}"
-echo -e "⚙️  ${blue}Local Port:${plain} 8081 (proxied via Nginx+SSL)"
+echo -e "⚙️  ${blue}Local Port:${plain} $panel_port"
 echo
 echo -e "${yellow}💡 Next Steps:${plain}"
-echo -e "   1. Open ${green}https://${subdomain}${plain} in your browser"
-echo -e "   2. Log in and immediately run ${yellow}x-ui${plain} to change username/password"
-echo -e "   3. Set a custom WebBasePath for extra security"
+echo -e "   1. Open ${green}https://$subdomain/$web_path${plain} in your browser"
+echo -e "   2. Log in and run ${yellow}x-ui${plain} to change username/password"
+echo -e "   3. Set additional security (2FA, Fail2Ban)"
 echo -e "   4. Monitor logs: ${yellow}x-ui log${plain}"
 echo
 print_info "Firewall status:"
